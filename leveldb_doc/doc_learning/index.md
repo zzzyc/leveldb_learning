@@ -73,5 +73,105 @@ write_options.sync = true;
 db->Put(write_options, ...);
 ```
 
+异步写通常比同步写快一千多倍。异步写的缺点是如果机器崩溃可能会导致最后几个更新丢失。
+
+注意，这仅仅是写进程的崩溃（即，不是宕机）不会造成任何损失，因为即使 sync 为 false，更新也会在被认为完成之前从进程内存中推入操作系统。
+
+<br/>
+
+异步写可以被更安全地使用。例如，当加载大量数据到数据库中，你可以在崩溃后重启批量加载来处理丢失的更新。
+
+混合方案也可以实现，其中每 n 次写入都是同步的，在发生崩溃时，大容量负载将在上次运行完成最后一次同步写入后重启。（同步写入可以更新一个标记，该标记描述崩溃时在哪里重新启动）
+
+
+`Writebatch` 提供一个可替代的异步写方式。在一个 `WriteBatch` 中执行多次操作，通过同步写一起执行。（即，`write_opions.sync` 设置为 `true`）。同步写的额外开销会被均摊到 `WriteBatch` 中的每个操作中
+
+
+## 并发
+一个数据库在同一时间只能被一个进程打开。leveldb 从操作系统获得一个锁，以防误用（一个数据库同一时间误被多个进程打开）。
+
+在一个进程的多个并发线程中，`leveldb::DB` 对象可以被安全地共享使用（线程安全）。即，同一进程中的不同线程可能在同一个数据库对象上执行写入或者获取迭代器或者调用Get操作，但也不需要额外的同步操作。（leveldb的实现已经做好了需要的同步操作）然而其他对象，像迭代器和 `WriteBatch` 可能也需要额外的同步操作。如果两个线程共享一个对象，他们必须使用自己的锁来实现安全的访问（即自己加锁来实现线程安全）。在头文件中有更多的细节。
+
+
+## 迭代器
+下面是一个如何打印数据库中所有 key 和 value 对的例子。
+
+
+```cpp
+leveldb::Iterator* it = db->NewIterator(leveldb::ReadOptions());
+for (it->SeekToFirst(); it->Valid(); it->Next()) {
+  cout << it->key().ToString() << ": "  << it->value().ToString() << endl;
+}
+assert(it->status().ok());  // Check for any errors found during the scan
+delete it;
+```
+
+下面是从 `start` 开始，遍历直到 `limit - 1` ，即 `[start, limit)` 。
+注意这里是 `std::string` 的比较。
+```cpp
+for (it->Seek(start);
+   it->Valid() && it->key().ToString() < limit;
+   it->Next()) {
+  ...
+}
+```
+
+下面是反向迭代
+```cpp
+for (it->SeekToLast(); it->Valid(); it->Prev()) {
+  ...
+}
+```
+
+## 快照
+
+快照为 KV 存储的整个状态提供了一致的只读视图。`ReadOptions::snapshot` 如果不是 `NULL` ，表示在进行读操作时应该操作数据库的指定版本（即快照）。如果 ReadOptions::snapshot` 如果是 `NULL` ，读操作将在当前状态的数据库上直接读取。
+
+快照由 `DB::GetSnapshot()` 方法创建。
+
+```cpp
+leveldb::ReadOptions options;
+options.snapshot = db->GetSnapshot();
+... apply some updates to db ...
+leveldb::Iterator* iter = db->NewIterator(options);
+... read using iter to view the state when the snapshot was created ...
+delete iter;
+db->ReleaseSnapshot(options.snapshot);
+```
+
+注意快照不再使用时，需要使用 `DB::ReleaseSnapshot` 释放，以使得之后读取的数据是当前数据库的最新状态下的数据。
+
+## Slice
+上述 `it->key()` 和 `it->value()` 调用的返回值类型都是 `leveldb::Slice` 。`Slice` 是一个简单的数据结构，包含 `size_` 表示长度，`data_` 是一个指针，指向堆内存区域的字节数组。 
+
+因为不需要复制大的 key 和 value ，故采取返回一个 `Slice` 来代替返回一个 `std::string` 的策略。此外，leveldb 的方法不会返回以非空结束的 C 风格的字符串，这是因为 leveldb 的 keys 和 values 允许包括 `\0` 字符。 
+
+C++ 字符串和以非空结束的 C 风格字符串可以被轻易地转换称为一个 `Slice`：
+```cpp
+leveldb::Slice s1 = "hello";
+std::cout << s1.ToString() << std::endl;
+
+std::string str("world");
+leveldb::Slice s2 = str;
+std::cout << s2.ToString() << std::endl;
+```
+
+`Slice` 也可以轻易地被转换回 C++ 字符串
+```cpp
+std::string str = s1.ToString();
+assert(str == std::string("hello"));
+```
+
+使用 `Slice` 时要小心，因为调用者要确保在使用 `Slice` 时， `Slice.data_` 指向的外部的字节数组内存还未被释放。下面的例子就存在内存问题：
+```cpp
+leveldb::Slice slice = "hello";
+if (...) {
+  std::string str = ...;
+  slice = str;
+}
+std::cout << slice.ToString() << std::endl;
+```
+当 `if` 语句出了作用域，`str` 的内存将被释放，`Slice.data_` 对应的内存也是无效的了。
+
 ****
 ... 待续
