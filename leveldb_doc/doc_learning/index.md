@@ -2,7 +2,7 @@ leveldb
 =======
 Jeff Dean, Sanjay Ghemawat
 
-leveldb 库提供持久化的 KV 存储。keys 和 values 可以是任意的字节数组。 keys 会根据用户指定的比较函数进行排序。（补充：默认的比较函数是 lexicographic byte-wise ordering 的，即按照字节的值大小去比较）
+leveldb 库提供持久化的 KV 存储。keys 和 values 可以是任意的字节数组。 keys 会根据用户指定的比较函数进行排序。（补充：默认的比较函数是 [lexicographic byte-wise ordering](../doubt/doubt.md) 的，即按照字节的值大小去比较）
 
 ## 打开 Databse
 一个 leveldb 数据库的 name 绑定到文件系统中的一个目录。数据库的所有内容都存储在这个文件目录下。下面是示范如何打开一个数据库，如果打开的不存在的话，先创建。
@@ -172,6 +172,82 @@ if (...) {
 std::cout << slice.ToString() << std::endl;
 ```
 当 `if` 语句出了作用域，`str` 的内存将被释放，`Slice.data_` 对应的内存也是无效的了。
+
+## 比较器
+
+上述例子用的是 leveldb 的默认比较器，可以理解为根据 ascii 码的大小去进行比较。你可以在打开数据库时提供一个自定义比较器。
+例如，假设每个数据库的 key 包括两个数字，我们要对第一个数字排序，如果第一个数字相同，再对第二个数字排序（即第一关键字和第二关键字）。定义一个合适的派生类 `leveldb::Comparator` 来实现自定义比较器：
+
+```cpp
+class TwoPartComparator : public leveldb::Comparator {
+ public:
+  // Three-way comparison function:
+  //   if a < b: negative result
+  //   if a > b: positive result
+  //   else: zero result
+  // 如果 a 小于 b，返回负数
+  // 如果 a 大于 b，返回正数
+  // 如果 a 等于 b，返回 0
+  int Compare(const leveldb::Slice& a, const leveldb::Slice& b) const {
+    int a1, a2, b1, b2;
+    ParseKey(a, &a1, &a2); // ParseKey 是一个解析 key 的方法，将 key 拆分成第一关键字和第二关键字
+    ParseKey(b, &b1, &b2);
+    if (a1 < b1) return -1;
+    if (a1 > b1) return +1;
+    if (a2 < b2) return -1;
+    if (a2 > b2) return +1;
+    return 0;
+  }
+
+  // 先忽视下面的方法
+  const char* Name() const { return "TwoPartComparator"; }
+  void FindShortestSeparator(std::string*, const leveldb::Slice&) const {}
+  void FindShortSuccessor(std::string*) const {}
+};
+```
+
+用上述自定义的比较器创建数据库：
+
+```cpp
+TwoPartComparator cmp;
+leveldb::DB* db;
+leveldb::Options options;
+options.create_if_missing = true;
+options.comparator = &cmp;
+leveldb::Status status = leveldb::DB::Open(options, "/tmp/testdb", &db);
+```
+
+## 向后兼容
+在打开一个已经存在的数据库时，比较器需要和创建时的比较器进行对比，如果两次不兼容，那么第二次排序就是不对的了。Leveldb新建数据库时，会向[MAINFEST](../doubt/doubt.md)写入一个比较器的名称，下次打开时会检查名称是否相同，来判断兼容性。如果当前打开的数据库的数据可以丢弃，那么你可以采用相同 `Name()` 的比较器，但是为新键增加版本号以及修改比较器函数，使得比较器会找到键的版本号，根据版本号来决定如何排序。注意：每次数据库被打开时，都会按照最新的比较器函数来对数据进行排序。
+
+## 性能指标
+通过更改 `include/options.h` 中定义的类型的默认值来调整性能。`WriteOptions`、`ReadOptions`、`Options` 和 `Comparator`。
+通过更改这些选项中的参数，可以更改 LevelDB 的行为以实现更好的性能。
+
+## 数据块 (Block)
+leveldb 将相邻的 key 分组放在同一 block 中，这样一个 block 就是持久化存储中传输的单位。默认的 block 大小是 4096 个未压缩的字节。恰当的 block 大小会优化数据库的性能。
+每个 block 有一个对应的 block header，用于存储该 block 的元信息，如 block 大小，最大和最小键值等。此外，每个 block 还可以被压缩以节省压缩空间。
+
+在 leveldb 中，block 是从磁盘读取的最小单位，当读取一个键值对时，首先会定位该键值对所在的 block ，并从磁盘中读取整个 block 。一旦读取到 block，leveldb 会在内存中解压缩该 block 并将其存储在内存中。
+
+对于写入操作，leveldb 将待写入的键值对存储在一个内存的数据结构中，称为 memtable，当 memtable 中的数据达到一定的阈值时，leveldb 会将 memtable 转换为一个不可变的 SSTable(Sorted String Table) ，即有序字符串表，所有的键值对按照键的字典序排序，并且被分割成多个 block 存储在磁盘上。
+
+注意在 leveldb 中，key 和 value 是分开存储的。
+
+## 压缩
+每个 block 在写入磁盘前都会被单独压缩。由于默认压缩方法非常快速而且自动禁用无法压缩的数据，默认情况下开启压缩。极少数情况下，应用程序希望完全禁用压缩，但是只有在 benchmarks 显示性能提高才会完全禁用，下面是一个示例：
+```cpp
+leveldb::Options options;
+options.compression = leveldb::kNoCompression;
+... 
+leveldb::DB::Open(options, name, ...) 
+....
+```
+
+leveldb 使用多种压缩方法，包括 Snappy、Zlib、Bzip2 等。默认情况下使用 Snappy，因为其速度很快。
+数据写入时，leveldb 会把每个 block 单独压缩后写入磁盘，如此可以显著减少磁盘空间占用，提高数据读取效率，对于大规模数据集，也可以降低 CPU 和 内存的使用了。
+
+极少数情况下，一些应用程序会遇到无法压缩的数据，此时开启压缩反而会影响性能，此时可以选择关闭压缩，但是需要通过 benchmarks 来验证是否真的会提高性能。
 
 ****
 ... 待续
